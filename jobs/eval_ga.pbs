@@ -1,0 +1,83 @@
+#!/bin/bash
+#PBS -q gpu
+#PBS -l select=1:ncpus=8:ngpus=1
+#PBS -l walltime=04:00:00
+#PBS -j oe
+
+# Evaluates every benchmark of the Multinex paper for the MultinexGA variants and,
+# with identical code on the same node, for the shipped Multinex-Nano checkpoints:
+#   - LOL-v1 / LOL-v2-real / LOL-v2-synthetic: PSNR, SSIM, LPIPS (Enhancement/test.py)
+#   - DICM / LIME / MEF / NPE: NIQE, BRISQUE (Enhancement/test_noref.py), for the
+#     checkpoint trained on each LOL split
+#   - params, GFLOPs@256x256, GPU latency (scripts/profile_models.py)
+# then writes results/eval_ga/summary.md (scripts/summarize_ga.py).
+#
+# Submit from ~/Multinex:  qsub -N ga_eval -o logs/eval_ga.log jobs/eval_ga.pbs
+# Optional: VARIANTS="Nano" to evaluate a subset.
+set -u
+VARIANTS=${VARIANTS:-"Nano Micro"}
+DATASETS="LOL-v1 LOL-v2-real LOL-v2-synthetic"
+NOREF="data/DICM data/LIME data/MEF data/NPE"
+OUT=results/eval_ga
+LOGS=logs/eval_ga
+
+cd /home/aman.125134/Multinex || exit 1
+source /home/soft/anaconda3/etc/profile.d/conda.sh
+conda activate multinex
+# gpu02 lacks the system libXext.so.6 that opencv-python links against; a copy of
+# the login node's RHEL 9.4 build (libXext-1.3.4-8.el9) lives in ~/syslibs.
+export LD_LIBRARY_PATH=$HOME/syslibs${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+mkdir -p $OUT $LOGS
+
+echo "Node: $(hostname)   Start: $(date)"
+# test.py / test_noref.py set CUDA_VISIBLE_DEVICES from --gpus themselves.
+GPU=$(nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits \
+      | sort -t, -k2,2nr | head -1 | cut -d, -f1 | tr -d ' ')
+echo "Using GPU $GPU"
+
+# eval_one <tag> <option file> <weights> <dataset>
+eval_one() {
+  echo "===== $1 $4  ($3)"
+  python Enhancement/test.py --opt "$2" --weights "$3" --dataset "$4" \
+    --result_dir $OUT/images --gpus $GPU > $LOGS/${1}_${4}.log 2>&1
+  grep -E "RGB  - (PSNR|SSIM)|LPIPS" $LOGS/${1}_${4}.log
+}
+
+# noref_one <tag> <option file> <weights> <training split>
+noref_one() {
+  echo "===== $1 NoRef (trained on $4)"
+  python Enhancement/test_noref.py --opt "$2" --weights "$3" --input_dirs $NOREF \
+    --result_dir $OUT/${1}_NoRef_${4} --gpus $GPU > $LOGS/${1}_NoRef_${4}.log 2>&1
+  cat $OUT/${1}_NoRef_${4}/final_report.csv
+}
+
+best_ckpt() {
+  ls -t experiments/$1/best_psnr_*.pth 2>/dev/null | head -1
+}
+
+# ---- baseline: shipped Multinex-Nano checkpoints
+for DS in $DATASETS; do
+  eval_one Nano-shipped Options/Multinex-Nano_${DS}.yaml pretrained_weights/Multinex-Nano_${DS}.pth $DS
+  noref_one Nano-shipped Options/Multinex-Nano_${DS}.yaml pretrained_weights/Multinex-Nano_${DS}.pth $DS
+done
+noref_one Nano-shipped Options/Multinex-Nano_LOL-v2-synthetic.yaml pretrained_weights/Multinex-Nano_dagger_NoRef.pth dagger
+
+# ---- ours
+for V in $VARIANTS; do
+  for DS in $DATASETS; do
+    CFG=MultinexGA-${V}_${DS}
+    W=$(best_ckpt $CFG)
+    if [ -z "$W" ]; then echo "!! no checkpoint for $CFG"; continue; fi
+    eval_one GA-$V Options/$CFG.yaml $W $DS
+    noref_one GA-$V Options/$CFG.yaml $W $DS
+  done
+done
+
+echo "===== complexity"
+CUDA_VISIBLE_DEVICES=$GPU python scripts/profile_models.py --opts \
+  Options/Multinex-Nano_LOL-v1.yaml Options/MultinexGA-Nano_LOL-v1.yaml Options/MultinexGA-Micro_LOL-v1.yaml \
+  | grep "|" | tee $OUT/complexity.md
+
+python scripts/summarize_ga.py --logs $LOGS --results $OUT --out $OUT/summary.md
+cat $OUT/summary.md
+echo "End: $(date)"

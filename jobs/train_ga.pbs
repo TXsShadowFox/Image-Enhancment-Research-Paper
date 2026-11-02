@@ -1,0 +1,61 @@
+#!/bin/bash
+#PBS -q gpu
+#PBS -l select=1:ncpus=16:ngpus=1
+#PBS -l walltime=24:00:00
+#PBS -j oe
+
+# Trains one MultinexGA variant on LOL-v1, LOL-v2-real and LOL-v2-synthetic
+# concurrently on a single GPU. The models are tiny and launch-bound, so three
+# processes share one GPU with little slowdown.
+#
+# Submit from ~/Multinex (add :host=gpuNN to the select to pin a node):
+#   qsub -N ga_nano  -v VARIANT=Nano  -o logs/train_ga_nano.log  jobs/train_ga.pbs
+#   qsub -N ga_micro -v VARIANT=Micro -o logs/train_ga_micro.log jobs/train_ga.pbs
+# Optional: DATASETS="LOL-v1 LOL-v2-real" to train a subset.
+set -u
+: "${VARIANT:?set VARIANT=Nano or VARIANT=Micro}"
+DATASETS=${DATASETS:-"LOL-v1 LOL-v2-real LOL-v2-synthetic"}
+
+cd /home/aman.125134/Multinex || exit 1
+source /home/soft/anaconda3/etc/profile.d/conda.sh
+conda activate multinex
+# gpu02 lacks the system libXext.so.6 that opencv-python links against; a copy of
+# the login node's RHEL 9.4 build (libXext-1.3.4-8.el9) lives in ~/syslibs.
+export LD_LIBRARY_PATH=$HOME/syslibs${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+
+echo "Node: $(hostname)   Start: $(date)   Variant: $VARIANT   Datasets: $DATASETS"
+nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv
+
+# PBS does not isolate GPUs on this cluster and other users' jobs hold most of
+# the memory. Among GPUs with >= MIN_FREE_MIB free (three trainings with the VGG
+# perceptual loss need ~15 GB), take the least-utilised; jobs that start together
+# are spread over the best two by job ID. Fall back to the GPU with most memory free.
+MIN_FREE_MIB=${MIN_FREE_MIB:-20000}
+CANDIDATES=$(nvidia-smi --query-gpu=index,utilization.gpu,memory.free --format=csv,noheader,nounits \
+      | awk -F', ' -v m="$MIN_FREE_MIB" '$3 >= m' | sort -t, -k2,2n -k3,3nr | cut -d, -f1 | head -2)
+if [ -n "$CANDIDATES" ]; then
+  N=$(echo "$CANDIDATES" | wc -l)
+  GPU=$(echo "$CANDIDATES" | sed -n "$(( ${PBS_JOBID%%.*} % N + 1 ))p")
+else
+  GPU=$(nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits \
+        | sort -t, -k2,2nr | head -1 | cut -d, -f1)
+fi
+GPU=$(echo "$GPU" | tr -d ' ')
+export CUDA_VISIBLE_DEVICES=$GPU
+echo "Using GPU $GPU"
+
+mkdir -p logs
+pids=()
+for DS in $DATASETS; do
+  CFG=MultinexGA-${VARIANT}_${DS}
+  echo "Launching $CFG -> logs/train_${CFG}.log"
+  python -m basicsr.train --opt Options/${CFG}.yaml > logs/train_${CFG}.log 2>&1 &
+  pids+=($!)
+done
+
+status=0
+for pid in "${pids[@]}"; do
+  wait "$pid" || status=1
+done
+echo "End: $(date)   exit status: $status"
+exit $status
