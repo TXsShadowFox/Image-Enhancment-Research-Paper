@@ -18,9 +18,9 @@ Design choices:
   starts from exactly the Multinex-Nano function (`tests/test_multinex_ga.py` checks this
   against the shipped checkpoint). The scale `1 + tanh(.)` stays in (0, 2), so a
   module can attenuate or amplify a channel but never flip its sign.
-- **GIC addresses the small receptive field.** Each output pixel of Nano sees only
-  a ~15 px window, too little to judge how much exposure correction the image as a
-  whole needs. The log-mean is the log-average luminance ("key") used in tone
+- **GIC addresses the small receptive field.** Each output pixel of Nano sees an
+  11×11 px window, plus a single-unit squeeze-excitation gate. That is too little to
+  judge how much exposure correction the image as a whole needs. The log-mean is the log-average luminance ("key") used in tone
   mapping; the chrominance means are a gray-world estimate of the illuminant colour.
 - **ARMG feeds illumination-invariant detail.** The learned luminance and chroma
   corrections are smooth, so brightening flattens texture. Single-scale Retinex
